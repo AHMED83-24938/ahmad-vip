@@ -277,6 +277,8 @@ class TelegramBotService:
         self.cfg = load_config()
         self.bot_token = self.cfg.get("bot_token", "")
         self.offset = 0
+        # Pending action for each admin: add/remove admin, add channel, or delete channel.
+        self.pending = {}
 
     def api_call(self, method, data=None):
         if not self.bot_token or self.bot_token == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
@@ -294,8 +296,53 @@ class TelegramBotService:
             print(f"Telegram API Error ({method}): {e}")
             return None
 
-    def send_message(self, chat_id, text):
-        return self.api_call("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+    def send_message(self, chat_id, text, keyboard=True):
+        data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        if keyboard:
+            data["reply_markup"] = json.dumps({
+                "keyboard": [
+                    [{"text": "➕ إضافة أدمن"}, {"text": "➖ مسح أدمن"}],
+                    [{"text": "🔗 إضافة قناة برابط"}, {"text": "📁 إضافة قنوات من ملف"}],
+                    [{"text": "🗑️ مسح قنوات"}, {"text": "📋 قائمة القنوات"}],
+                    [{"text": "📊 الحالة"}, {"text": "❌ إلغاء"}]
+                ],
+                "resize_keyboard": True,
+                "is_persistent": True
+            }, ensure_ascii=False)
+        return self.api_call("sendMessage", data)
+
+    def channel_entries(self):
+        """Return M3U channels as (name, url, raw_lines) entries."""
+        lines = get_m3u_content().splitlines()
+        entries = []
+        current = None
+        for line in lines:
+            if line.startswith("#EXTINF:"):
+                if current:
+                    entries.append(current)
+                name = line.rsplit(",", 1)[-1].strip() if "," in line else "قناة بدون اسم"
+                current = {"name": name, "extinf": line, "url": ""}
+            elif current and line.strip() and not line.startswith("#"):
+                current["url"] = line.strip()
+                entries.append(current)
+                current = None
+        if current:
+            entries.append(current)
+        return entries
+
+    def add_channel_to_playlist(self, name, url):
+        name = name.strip()
+        url = url.strip()
+        if not name or not url or not (url.startswith("http://") or url.startswith("https://")):
+            return False, "أرسل اسم قناة ورابط بث يبدأ بـ http:// أو https://."
+        content = get_m3u_content()
+        if not content.startswith("#EXTM3U"):
+            content = "#EXTM3U\\n"
+        if not content.endswith("\\n"):
+            content += "\\n"
+        content += f'#EXTINF:-1,{name}\\n{url}\\n'
+        set_m3u_content(content)
+        return True, "تمت إضافة القناة وتحديث ملف القنوات."
 
     def download_file(self, file_id):
         res = self.api_call("getFile", {"file_id": file_id})
@@ -321,80 +368,228 @@ class TelegramBotService:
         text = message.get("text", "").strip()
 
         if not self.is_admin(user_id):
-            self.send_message(chat_id, f"⛔ *غير مصرح لك باستعمال هذا البوت.*\n\nالآيدي الخاص بك: `{user_id}`\nراسل الأدمن لإضافتك.")
+            self.send_message(chat_id, f"⛔ غير مصرح لك باستعمال هذا البوت.\nالآيدي الخاص بك: `{user_id}`\nراسل الأدمن لإضافتك.", keyboard=False)
             return
 
-        # Commands
+        # Main menu buttons and command aliases
         if text.startswith("/start") or text.startswith("/help"):
-            msg = (
-                "⭐️ *لوحة تحكم بوت ArenaScore - القنوات المدفوعة*\n\n"
-                "الأوامر المتاحة للأدمن:\n"
-                "🔹 `/setcode <الكود_الجديد>` : تغيير كود التفعيل\n"
-                "🔹 `/addadmin <TELEGRAM_ID>` : إضافة أدمن جديد للبوت\n"
-                "🔹 `/listadmins` : عرض قائمة الأدمنية\n"
-                "🔹 `/status` : حالة السيرفر وكود التفعيل الحالي\n\n"
-                "📤 *رفع ملف M3U جديد:*\n"
-                "قم بإرسال ملف `.m3u` كـ مستند (Document) إلى البوت وسيتم تحديث القنوات فوراً وتشفيرها بأقوى تشفير!"
-            )
-            self.send_message(chat_id, msg)
+            self.pending.pop(user_id, None)
+            self.send_message(chat_id,
+                "⭐️ *لوحة تحكم القنوات*\n\nاختَر العملية من الأزرار:\n"
+                "➕ إضافة أدمن أو ➖ مسح أدمن\n"
+                "🔗 إضافة قناة برابط بث\n"
+                "📁 رفع ملف M3U/TXT لإضافة أو استبدال قائمة القنوات\n"
+                "🗑️ مسح قناة حسب الرقم من القائمة.")
+            return
 
-        elif text.startswith("/setcode"):
-            parts = text.split(maxsplit=1)
-            if len(parts) > 1:
-                new_code = parts[1].strip()
-                self.cfg["activation_code"] = new_code
-                save_config(self.cfg)
-                self.send_message(chat_id, f"✅ *تم تغيير كود التفعيل بنجاح!*\n\nالكود الجديد: `{new_code}`")
-            else:
-                self.send_message(chat_id, "⚠️ *طريقة الاستعمال:*\n`/setcode الكود_الجديد`")
+        if text == "❌ إلغاء" or text.startswith("/cancel"):
+            self.pending.pop(user_id, None)
+            self.send_message(chat_id, "تم إلغاء العملية.")
+            return
 
-        elif text.startswith("/addadmin"):
+        if text == "➕ إضافة أدمن" or text.startswith("/addadmin"):
             parts = text.split()
-            if len(parts) > 1 and parts[1].isdigit():
-                new_admin_id = int(parts[1])
-                if new_admin_id not in self.cfg["admins"]:
-                    self.cfg["admins"].append(new_admin_id)
+            if text.startswith("/addadmin") and len(parts) > 1 and parts[1].isdigit():
+                new_id = int(parts[1])
+                self.cfg = load_config()
+                admins = self.cfg.setdefault("admins", [])
+                if new_id not in admins:
+                    admins.append(new_id)
                     save_config(self.cfg)
-                    self.send_message(chat_id, f"✅ *تم إضافة الأدمن بنجاح!*\n\nID: `{new_admin_id}`")
+                    self.send_message(chat_id, f"✅ تمت إضافة الأدمن.\nID: `{new_id}`")
                 else:
-                    self.send_message(chat_id, "ℹ️ هذا المستخدم أدمن بالفعل.")
+                    self.send_message(chat_id, "هذا المستخدم أدمن بالفعل.")
             else:
-                self.send_message(chat_id, "⚠️ *طريقة الاستعمال:*\n`/addadmin 123456789`")
+                self.pending[user_id] = {"action": "add_admin"}
+                self.send_message(chat_id, "أرسل آيدي تيليجرام للشخص الذي تريد إضافته كأدمن.")
+            return
 
-        elif text.startswith("/listadmins"):
-            admins_str = "\n".join([f"• `{a}`" for a in self.cfg.get("admins", [])])
-            self.send_message(chat_id, f"👥 *قائمة الأدمنية المعتمدين:*\n\n{admins_str}")
+        if text == "➖ مسح أدمن" or text.startswith("/removeadmin"):
+            parts = text.split()
+            if text.startswith("/removeadmin") and len(parts) > 1 and parts[1].isdigit():
+                target = int(parts[1])
+                self.remove_admin(chat_id, target)
+            else:
+                self.pending[user_id] = {"action": "remove_admin"}
+                self.send_message(chat_id, "أرسل آيدي الأدمن الذي تريد حذفه.")
+            return
 
-        elif text.startswith("/status"):
-            code = self.cfg.get("activation_code", "غير محدد")
-            m3u = get_m3u_content()
-            channel_count = m3u.count("#EXTINF:")
-            msg = (
-                "📊 *حالة سيرفر القنوات المدفوعة:*\n\n"
-                f"🔑 *كود التفعيل الحالي:* `{code}`\n"
-                f"📺 *عدد القنوات في الملف:* `{channel_count}` قناة\n"
-                f"🔒 *حالة التشفير:* AES-256-CBC + HMAC-SHA256 مفعّل\n"
-                f"🌐 *رابط التليجرام:* https://t.me/AHMAD_TV2"
-            )
-            self.send_message(chat_id, msg)
+        if text == "🔗 إضافة قناة برابط" or text.startswith("/addchannel"):
+            parts = text.split(maxsplit=1)
+            if text.startswith("/addchannel") and len(parts) > 1 and "|" in parts[1]:
+                name, url = parts[1].split("|", 1)
+                ok, result = self.add_channel_to_playlist(name, url)
+                self.send_message(chat_id, ("✅ " if ok else "⚠️ ") + result)
+            else:
+                self.pending[user_id] = {"action": "add_channel_name"}
+                self.send_message(chat_id, "أرسل اسم القناة أولاً.")
+            return
 
-        # Handling uploaded M3U Document
-        elif "document" in message:
+        if text == "📁 إضافة قنوات من ملف":
+            self.pending.pop(user_id, None)
+            self.send_message(chat_id, "أرسل ملف القنوات بصيغة `.m3u` أو `.m3u8` أو `.txt` كمستند. سيتم استبدال القائمة الحالية بمحتوى الملف.")
+            return
+
+        if text == "🗑️ مسح قنوات" or text.startswith("/deletechannel"):
+            entries = self.channel_entries()
+            if not entries:
+                self.send_message(chat_id, "لا توجد قنوات في القائمة لمسحها.")
+                return
+            lines = ["🗑️ *قائمة القنوات — أرسل رقم القناة لمسحها:*"]
+            for i, item in enumerate(entries[:100], 1):
+                lines.append(f"`{i}` — {item['name']}")
+            if len(entries) > 100:
+                lines.append(f"... توجد {len(entries)} قناة. اعرض أول 100 فقط.")
+            self.pending[user_id] = {"action": "delete_channel"}
+            self.send_message(chat_id, "\n".join(lines))
+            return
+
+        if text == "📋 قائمة القنوات":
+            entries = self.channel_entries()
+            if not entries:
+                self.send_message(chat_id, "قائمة القنوات فارغة.")
+            else:
+                lines = [f"📺 *عدد القنوات: {len(entries)}*"]
+                lines.extend(f"`{i}` — {item['name']}" for i, item in enumerate(entries[:100], 1))
+                self.send_message(chat_id, "\n".join(lines))
+            return
+
+        if text == "📊 الحالة" or text.startswith("/status"):
+            self.cfg = load_config()
+            entries = self.channel_entries()
+            self.send_message(chat_id,
+                f"📊 *الحالة*\n\n📺 عدد القنوات: `{len(entries)}`\n"
+                f"👥 عدد الأدمنية: `{len(self.cfg.get('admins', []))}`\n"
+                f"🔐 كود التفعيل: `{self.cfg.get('activation_code', 'غير محدد')}`")
+            return
+
+        # Continue any pending multi-step operation
+        pending = self.pending.get(user_id)
+        if pending:
+            action = pending.get("action")
+
+            if action in ("add_admin", "remove_admin"):
+                if not text.isdigit():
+                    self.send_message(chat_id, "آيدي غير صحيح. أرسل أرقام الآيدي فقط، أو اضغط ❌ إلغاء.")
+                    return
+                target = int(text)
+                self.pending.pop(user_id, None)
+                if action == "add_admin":
+                    self.cfg = load_config()
+                    admins = self.cfg.setdefault("admins", [])
+                    if target in admins:
+                        self.send_message(chat_id, "هذا المستخدم أدمن بالفعل.")
+                    else:
+                        admins.append(target)
+                        save_config(self.cfg)
+                        self.send_message(chat_id, f"✅ تمت إضافة الأدمن بنجاح.\nID: `{target}`")
+                else:
+                    self.remove_admin(chat_id, target)
+                return
+
+            if action == "add_channel_name":
+                if not text or text.startswith("/"):
+                    self.send_message(chat_id, "أرسل اسم قناة صحيحاً.")
+                    return
+                self.pending[user_id] = {"action": "add_channel_url", "name": text}
+                self.send_message(chat_id, "هسه أرسل رابط البث المباشر للقناة (HTTP أو HTTPS).")
+                return
+
+            if action == "add_channel_url":
+                name = pending.get("name", "")
+                self.pending.pop(user_id, None)
+                ok, result = self.add_channel_to_playlist(name, text)
+                self.send_message(chat_id, ("✅ " if ok else "⚠️ ") + result)
+                return
+
+            if action == "delete_channel":
+                if not text.isdigit():
+                    self.send_message(chat_id, "أرسل رقم القناة فقط، أو اضغط ❌ إلغاء.")
+                    return
+                index = int(text)
+                entries = self.channel_entries()
+                if index < 1 or index > len(entries):
+                    self.send_message(chat_id, f"الرقم غير صحيح. اختر رقماً بين 1 و {len(entries)}.")
+                    return
+                target = entries[index - 1]
+                lines = get_m3u_content().splitlines()
+                output = []
+                i = 0
+                channel_index = 0
+                while i < len(lines):
+                    if lines[i].startswith("#EXTINF:"):
+                        channel_index += 1
+                        if channel_index == index:
+                            i += 1
+                            # Skip channel metadata/comments until the stream URL, then skip URL too.
+                            while i < len(lines) and (not lines[i].strip() or lines[i].startswith("#")):
+                                i += 1
+                            if i < len(lines):
+                                i += 1
+                            continue
+                    output.append(lines[i])
+                    i += 1
+                content = "\n".join(output).strip() + "\n"
+                if not content.startswith("#EXTM3U"):
+                    content = "#EXTM3U\n" + content
+                set_m3u_content(content)
+                self.pending.pop(user_id, None)
+                self.send_message(chat_id, f"🗑️ تم مسح القناة: *{target['name']}*")
+                return
+
+        # Accept channel file uploads
+        if "document" in message:
             doc = message["document"]
             file_name = doc.get("file_name", "").lower()
             file_id = doc.get("file_id")
-
-            if file_name.endswith(".m3u") or file_name.endswith(".m3u8") or file_name.endswith(".txt"):
-                self.send_message(chat_id, "⏳ جاري تحميل وتشفير ملف M3U...")
+            if file_name.endswith((".m3u", ".m3u8", ".txt")):
+                self.send_message(chat_id, "⏳ جاري تحميل ملف القنوات...")
                 content = self.download_file(file_id)
                 if content and "#EXT" in content:
+                    if not content.startswith("#EXTM3U"):
+                        content = "#EXTM3U\n" + content
                     set_m3u_content(content)
                     count = content.count("#EXTINF:")
-                    self.send_message(chat_id, f"🎉 *تم تحديث وتشفير ملف M3U بنجاح!*\n\nعدد القنوات التي تم استخراجها: `{count}` قناة.")
+                    self.send_message(chat_id, f"✅ تم تحديث ملف القنوات بنجاح.\nعدد القنوات: `{count}`")
                 else:
-                    self.send_message(chat_id, "❌ *فشل في قراءة الملف.* يرجى التأكد من أن الملف بصيغة M3U صحيحة تحتوي على `#EXTM3U`.")
+                    self.send_message(chat_id, "❌ الملف غير صالح أو لا يحتوي على قنوات M3U.")
             else:
-                self.send_message(chat_id, "⚠️ يرجى إرسال ملف بصيغة `.m3u` أو `.m3u8`.")
+                self.send_message(chat_id, "أرسل ملف بصيغة `.m3u` أو `.m3u8` أو `.txt`.")
+            return
+
+        # Existing command compatibility
+        if text.startswith("/setcode"):
+            parts = text.split(maxsplit=1)
+            if len(parts) > 1:
+                self.cfg = load_config()
+                self.cfg["activation_code"] = parts[1].strip()
+                save_config(self.cfg)
+                self.send_message(chat_id, "✅ تم تغيير كود التفعيل.")
+            else:
+                self.send_message(chat_id, "الاستخدام: `/setcode الكود_الجديد`")
+            return
+
+        if text.startswith("/listadmins"):
+            self.cfg = load_config()
+            admins = self.cfg.get("admins", [])
+            self.send_message(chat_id, "👥 *قائمة الأدمنية:*\n" + ("\n".join(f"`{a}`" for a in admins) if admins else "لا يوجد أدمنية."))
+            return
+
+        self.send_message(chat_id, "اختَر عملية من الأزرار، أو اكتب /start لعرض لوحة التحكم.")
+
+    def remove_admin(self, chat_id, target):
+        self.cfg = load_config()
+        admins = self.cfg.setdefault("admins", [])
+        # Protect the first configured admin from accidental removal.
+        if admins and target == admins[0]:
+            self.send_message(chat_id, "⛔ لا يمكن حذف الأدمن الأساسي.")
+            return
+        if target not in admins:
+            self.send_message(chat_id, "هذا الآيدي غير موجود ضمن الأدمنية.")
+            return
+        admins.remove(target)
+        save_config(self.cfg)
+        self.send_message(chat_id, f"✅ تم حذف الأدمن.\nID: `{target}`")
 
     def start_polling(self):
         print("🤖 Telegram Bot Polling started...")
